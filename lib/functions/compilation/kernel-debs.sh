@@ -64,18 +64,8 @@ function prepare_kernel_packaging_debs() {
 	# display_alert "tmp_kernel_install_dirs INSTALL_HDR_PATH:" "${tmp_kernel_install_dirs[INSTALL_HDR_PATH]}" "debug"
 	# display_alert "tmp_kernel_install_dirs INSTALL_DTBS_PATH:" "${tmp_kernel_install_dirs[INSTALL_DTBS_PATH]}" "debug"
 
-	# For armhf, kernel's "make install" gives us the wrong "vmlinuz-xx" file. We want the arch/arm/boot/zImage.
-	if [[ "${ARCH}" == "armhf" ]]; then # @TODO: if you know a better way? some kbuild var? send PR.
-		display_alert "armhf: using arch/arm/boot/zImage as vmlinuz" "armhf zImage" "info"
-		run_host_command_logged ls -la "${kernel_work_dir}/arch/arm/boot/zImage" || true
-		run_host_command_logged file "${kernel_work_dir}/arch/arm/boot/zImage" || true
-		run_host_command_logged ls -la "${tmp_kernel_install_dirs[INSTALL_PATH]}/vmlinuz-${kernel_version_family}" || true
-		run_host_command_logged file "${tmp_kernel_install_dirs[INSTALL_PATH]}/vmlinuz-${kernel_version_family}" || true
-		# Just overwrite it...
-		run_host_command_logged cp -v "${kernel_work_dir}/arch/arm/boot/zImage" "${tmp_kernel_install_dirs[INSTALL_PATH]}/vmlinuz-${kernel_version_family}"
-		run_host_command_logged file "${tmp_kernel_install_dirs[INSTALL_PATH]}/vmlinuz-${kernel_version_family}"
-		display_alert "armhf: using arch/arm/boot/zImage as vmlinuz" "done with armhf zImage" "debug"
-	fi
+	# Due to we call `make install` twice, we will get some `.old` files
+	run_host_command_logged rm -rf "${tmp_kernel_install_dirs[INSTALL_PATH]}/*.old" || true
 
 	# package the linux-image (image, modules, dtbs (if present))
 	display_alert "Packaging linux-image" "${LINUXFAMILY} ${LINUXCONFIG}" "info"
@@ -163,6 +153,27 @@ function kernel_package_hook_helper() {
 		#!/bin/bash
 		echo "Armbian '${package_name}' for '${kernel_version_family}': '${script}' starting."
 		set -e # Error control
+
+		function is_boot_dev_vfat() {
+			# When installing these packages during image build, /boot is not mounted, and will most definitely not be vfat.
+			# Use an environment variable to signal that it _will_ be a fat32, so symlinks are not created.
+			# This is passed by install_deb_chroot() explicitly via the runners.
+			if [[ "\${ARMBIAN_IMAGE_BUILD_BOOTFS_TYPE:-"unknown"}" == "fat" ]]; then
+				echo "Armbian: ARMBIAN_IMAGE_BUILD_BOOTFS_TYPE: '\${ARMBIAN_IMAGE_BUILD_BOOTFS_TYPE:-"not set"}'"
+				return 0
+			fi
+			if ! mountpoint -q /boot; then
+				return 1
+			fi
+			local boot_partition bootfstype
+			boot_partition=\$(findmnt --nofsroot -n -o SOURCE /boot)
+			bootfstype=\$(blkid -s TYPE -o value \$boot_partition)
+			if [[ "\$bootfstype" == "vfat" ]]; then
+				return 0
+			fi
+			return 1
+		}
+
 		set -x # Debugging
 
 		$(cat "${contents}")
@@ -181,18 +192,37 @@ function kernel_package_hook_helper() {
 function kernel_package_callback_linux_image() {
 	display_alert "linux-image deb packaging" "${package_directory}" "debug"
 
-	declare installed_image_path="boot/vmlinuz-${kernel_version_family}" # using old mkdebian terminology here.
-	declare image_name="Image"                                           # "Image" for arm64. or, "zImage" for arm, or "vmlinuz" for others.
+	# @TODO: we expect _all_ kernels to produce this, which is... not true.
+	declare kernel_pre_package_path="${tmp_kernel_install_dirs[INSTALL_PATH]}"
+	declare kernel_image_pre_package_path="${kernel_pre_package_path}/vmlinuz-${kernel_version_family}"
+	declare installed_image_path="boot/vmlinuz-${kernel_version_family}" # using old mkdebian terminology here for compatibility
+
+	display_alert "Showing contents of Kbuild produced /boot" "linux-image" "debug"
+	run_host_command_logged tree -C --du -h "${tmp_kernel_install_dirs[INSTALL_PATH]}"
+
+	display_alert "Kernel-built image filetype" "vmlinuz-${kernel_version_family}: $(file --brief "${kernel_image_pre_package_path}")" "info"
+
+	declare image_name="Image" # "Image" for arm64. or, "zImage" for arm, or "vmlinuz" for others. 'image_name' is for easy mkdebian compat
 	# If NAME_KERNEL is set (usually in arch config file), warn and use that instead.
 	if [[ -n "${NAME_KERNEL}" ]]; then
 		display_alert "NAME_KERNEL is set" "using '${NAME_KERNEL}' instead of '${image_name}'" "debug"
 		image_name="${NAME_KERNEL}"
-	else
-		display_alert "NAME_KERNEL is not set" "using default '${image_name}'" "debug"
 	fi
 
-	display_alert "Showing contents of Kbuild produced /boot" "linux-image" "debug"
-	run_host_command_logged tree -C --du -h "${tmp_kernel_install_dirs[INSTALL_PATH]}"
+	# allow hook to do stuff here. Some (legacy/vendor/weird) kernels spit out a vmlinuz that needs manual conversion to uImage, etc.
+	run_host_command_logged ls -la "${kernel_pre_package_path}" "${kernel_image_pre_package_path}"
+
+	call_extension_method "pre_package_kernel_image" <<- 'PRE_PACKAGE_KERNEL_IMAGE'
+		*fix Image/uImage/zImage before packaging kernel*
+		Some (legacy/vendor) kernels need preprocessing of the produced Image/uImage/zImage before packaging.
+		Use this hook to do that, by modifying the file in place, in `${kernel_pre_package_path}` directory.
+		The final file that will be used is stored in `${kernel_image_pre_package_path}` -- which you shouldn't change.
+	PRE_PACKAGE_KERNEL_IMAGE
+
+	display_alert "Kernel image filetype after pre_package_kernel_image" "vmlinuz-${kernel_version_family}: $(file --brief "${kernel_image_pre_package_path}")" "info"
+
+	unset kernel_pre_package_path       # be done with var after hook
+	unset kernel_image_pre_package_path # be done with var after hook
 
 	run_host_command_logged cp -rp "${tmp_kernel_install_dirs[INSTALL_PATH]}" "${package_directory}/"         # /boot stuff
 	run_host_command_logged cp -rp "${tmp_kernel_install_dirs[INSTALL_MOD_PATH]}/lib" "${package_directory}/" # so "lib" stuff sits at the root
@@ -235,7 +265,8 @@ function kernel_package_callback_linux_image() {
 		mkdir -p "${package_directory}${debian_kernel_hook_dir}/${script}.d" # create kernel hook dir, make sure.
 
 		kernel_package_hook_helper "${script}" <(
-			cat <<- KERNEL_HOOK_DELEGATION
+			# Common for all of postinst/postrm/preinst/prerm
+			cat <<- KERNEL_HOOK_DELEGATION # Reference: linux-image-6.1.0-7-amd64.postinst from Debian
 				export DEB_MAINT_PARAMS="\$*" # Pass maintainer script parameters to hook scripts
 				export INITRD=$(if_enabled_echo CONFIG_BLK_DEV_INITRD Yes No) # Tell initramfs builder whether it's wanted
 				# Run the same hooks Debian/Ubuntu would for their kernel packages.
@@ -244,24 +275,35 @@ function kernel_package_callback_linux_image() {
 
 			if [[ "${script}" == "preinst" ]]; then
 				cat <<- HOOK_FOR_REMOVE_VFAT_BOOT_FILES
-					check_boot_dev (){
-						boot_partition=\$(findmnt --nofsroot -n -o SOURCE /boot)
-						bootfstype=\$(blkid -s TYPE -o value \$boot_partition)
-						if [ "\$bootfstype" = "vfat" ]; then
-							rm -f /boot/System.map* /boot/config* /boot/vmlinuz* /boot/$image_name /boot/uImage
-						fi
-					}
-					mountpoint -q /boot && check_boot_dev
+					if is_boot_dev_vfat; then
+						rm -f /boot/System.map* /boot/config* /boot/vmlinuz* /boot/$image_name /boot/uImage
+					fi
 				HOOK_FOR_REMOVE_VFAT_BOOT_FILES
 			fi
 
 			# @TODO: only if u-boot, only for postinst. Gotta find a hook scheme for these...
 			if [[ "${script}" == "postinst" ]]; then
-				cat <<- HOOK_FOR_LINK_TO_LAST_INSTALLED_KERNEL
-					echo "Armbian: update last-installed kernel symlink to '$image_name'..."
-					ln -sfv $(basename "${installed_image_path}") /boot/$image_name || mv -v /${installed_image_path} /boot/${image_name}
+				cat <<- HOOK_FOR_LINK_TO_LAST_INSTALLED_KERNEL # image_name="${NAME_KERNEL}", above
 					touch /boot/.next
+					if is_boot_dev_vfat; then
+						echo "Armbian: FAT32 /boot: move last-installed kernel to '$image_name'..."
+						mv -v /${installed_image_path} /boot/${image_name}
+					else
+						echo "Armbian: update last-installed kernel symlink to '$image_name'..."
+						ln -sfv $(basename "${installed_image_path}") /boot/$image_name
+					fi
 				HOOK_FOR_LINK_TO_LAST_INSTALLED_KERNEL
+
+				# Reference: linux-image-6.1.0-7-amd64.postinst from Debian
+				cat <<- HOOK_FOR_DEBIAN_COMPAT_SYMLINK
+					# call debian helper, for compatibility. this symlinks things according to /etc/kernel-img.conf
+					# "install" or "upgrade" are decided in a very contrived way by Debian (".fresh-install" file)
+					# do NOT do this if /boot is a vfat, though.
+					if ! is_boot_dev_vfat; then
+						echo "Armbian: Debian compat: linux-update-symlinks install ${kernel_version_family} ${installed_image_path}"
+						linux-update-symlinks install "${kernel_version_family}" "${installed_image_path}" || true
+					fi
+				HOOK_FOR_DEBIAN_COMPAT_SYMLINK
 			fi
 		)
 	done
@@ -284,7 +326,7 @@ function kernel_package_callback_linux_dtb() {
 		Package: ${package_name}
 		Architecture: ${ARCH}
 		Provides: linux-dtb, linux-dtb-armbian, armbian-$BRANCH
-		Description: Armbian Linux $BRANCH DTBs ${artifact_version_reason:-"${kernel_version_family}"}
+		Description: Armbian Linux $BRANCH DTBs ${artifact_version_reason:-"${kernel_version_family}"} in /boot/dtb-${kernel_version_family}
 		 This package contains device blobs from the Linux kernel, version ${kernel_version_family}
 	CONTROL_FILE
 
@@ -298,7 +340,13 @@ function kernel_package_callback_linux_dtb() {
 	kernel_package_hook_helper "postinst" <(
 		cat <<- EOT
 			cd /boot
-			ln -sfT dtb-${kernel_version_family} dtb || mv dtb-${kernel_version_family} dtb
+			if ! is_boot_dev_vfat; then
+				echo "Armbian: DTB: symlinking /boot/dtb to /boot/dtb-${kernel_version_family}..."
+				ln -sfTv "dtb-${kernel_version_family}" dtb
+			else
+				echo "Armbian: DTB: FAT32: moving /boot/dtb-${kernel_version_family} to /boot/dtb ..."
+				mv -v "dtb-${kernel_version_family}" dtb
+			fi
 		EOT
 	)
 
@@ -362,6 +410,15 @@ function kernel_package_callback_linux_headers() {
 	tar -c -f - -C "${kernel_work_dir}" -T "${temp_file_list}" | tar -xf - -C "${headers_target_dir}"
 
 	# ${temp_file_list} is left at WORKDIR for later debugging, will be removed by WORKDIR cleanup trap
+
+	# Small detour: in v6.3-rc1, in commit https://github.com/torvalds/linux/commit/799fb82aa132fa3a3886b7872997a5a84e820062,
+	#               the tools/vm dir was renamed to tools/mm. Unfortunately tools/Makefile still expects it to exist,
+	#               and "make clean" in the "/tools" dir fails. Drop in a fake Makefile there to work around this.
+	if [[ ! -f "${headers_target_dir}/tools/vm/Makefile" ]]; then
+		display_alert "Creating fake tools/vm/Makefile" "6.3+ hackfix" "debug"
+		mkdir -p "${headers_target_dir}/tools/vm"
+		echo -e "clean:\n\techo fake clean for tools/vm" > "${headers_target_dir}/tools/vm/Makefile"
+	fi
 
 	# Now, make the script dirs clean.
 	# This is run in our _target_ dir, NOT the source tree, so we're free to make clean as we wish without invalidating the next build's cache.

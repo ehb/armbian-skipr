@@ -10,6 +10,7 @@
 function create_artifact_functions() {
 	declare -a funcs=(
 		"cli_adapter_pre_run" "cli_adapter_config_prep"
+		"config_dump"
 		"prepare_version"
 		"get_default_oci_target"
 		"is_available_in_local_cache" "is_available_in_remote_cache" "obtain_from_remote_cache"
@@ -67,6 +68,8 @@ function initialize_artifact() {
 }
 
 function obtain_complete_artifact() {
+	: "${artifact_prefix_version:?artifact_prefix_version is not set}"
+
 	declare -g artifact_name="undetermined"
 	declare -g artifact_type="undetermined"
 	declare -g artifact_version="undetermined"
@@ -101,8 +104,10 @@ function obtain_complete_artifact() {
 	[[ "x${artifact_base_dir}x" == "xx" || "${artifact_base_dir}" == "undetermined" ]] && exit_with_error "artifact_base_dir is not set after artifact_prepare_version"
 	[[ "x${artifact_final_file}x" == "xx" || "${artifact_final_file}" == "undetermined" ]] && exit_with_error "artifact_final_file is not set after artifact_prepare_version"
 
-	# validate artifact_version begins with artifact_prefix_version
-	[[ "${artifact_version}" =~ ^${artifact_prefix_version} ]] || exit_with_error "artifact_version '${artifact_version}' does not begin with artifact_prefix_version '${artifact_prefix_version}'"
+	# validate artifact_version begins with artifact_prefix_version when building deb packages (or deb-tar)
+	if [[ "${artifact_type}" != "tar.zst" ]]; then
+		[[ "${artifact_version}" =~ ^${artifact_prefix_version} ]] || exit_with_error "artifact_version '${artifact_version}' does not begin with artifact_prefix_version '${artifact_prefix_version}'"
+	fi
 
 	# validate artifact_type... it must be one of the supported types
 	case "${artifact_type}" in
@@ -140,8 +145,6 @@ function obtain_complete_artifact() {
 	debug_var artifact_final_file_basename
 	debug_var artifact_file_relative
 
-	# @TODO: possibly stop here if only for up-to-date-checking
-
 	# Determine OCI coordinates. OCI_TARGET_BASE overrides the default proposed by the artifact.
 	declare artifact_oci_target_base="undetermined"
 	if [[ -n "${OCI_TARGET_BASE}" ]]; then
@@ -153,6 +156,34 @@ function obtain_complete_artifact() {
 	[[ -z "${artifact_oci_target_base}" ]] && exit_with_error "No artifact_oci_target_base defined."
 
 	declare -g artifact_full_oci_target="${artifact_oci_target_base}${artifact_name}:${artifact_version}"
+
+	# if CONFIG_DEFS_ONLY, dump JSON and exit
+	if [[ "${CONFIG_DEFS_ONLY}" == "yes" ]]; then
+		display_alert "artifact" "CONFIG_DEFS_ONLY is set, skipping artifact creation" "warn"
+
+		declare -a wanted_vars=(
+			artifact_name
+			artifact_type
+			artifact_version
+			artifact_version_reason
+			artifact_base_dir
+			artifact_final_file
+			artifact_final_file_basename
+			artifact_file_relative
+			artifact_full_oci_target
+		)
+
+		declare -A ARTIFACTS_VAR_DICT=()
+
+		for var in "${wanted_vars[@]}"; do
+			ARTIFACTS_VAR_DICT["${var}"]="$(declare -p "${var}")"
+		done
+
+		display_alert "Dumping JSON" "for ${#ARTIFACTS_VAR_DICT[@]} variables" "ext"
+		python3 "${SRC}/lib/tools/configdump2json.py" "--args" "${ARTIFACTS_VAR_DICT[@]}" # to stdout
+
+		exit 0
+	fi
 
 	declare -g artifact_exists_in_local_cache="undetermined"
 	declare -g artifact_exists_in_remote_cache="undetermined"
@@ -199,6 +230,12 @@ function obtain_complete_artifact() {
 		# @TODO: if deploying to remote cache, force high compression, DEB_COMPRESS="xz"
 		artifact_build_from_sources # definitely will end up having its own logging sections
 
+		# For cases like CREATE_PATCHES=yes or KERNEL_CONFIGURE=yes, we wanna stop here. No artifact file will be created.
+		if [[ "${ARTIFACT_WILL_NOT_BUILD}" == "yes" ]]; then
+			display_alert "artifact" "ARTIFACT_WILL_NOT_BUILD is set, stopping after non-build." "debug"
+			return 0
+		fi
+
 		# pack the artifact to local cache (eg: for deb-tar)
 		LOG_SECTION="pack_artifact_to_local_cache" do_with_logging pack_artifact_to_local_cache
 
@@ -215,6 +252,27 @@ function obtain_complete_artifact() {
 	fi
 }
 
+function dump_artifact_config() {
+	initialize_artifact "${WHAT}"
+
+	declare -A -g artifact_input_variables=()
+	debug_dict artifact_input_variables
+
+	artifact_config_dump
+
+	debug_dict artifact_input_variables
+
+	# loop over the keys
+	declare -a concat
+	for key in "${!artifact_input_variables[@]}"; do
+		# echo the key and its value
+		concat+=("${key}=${artifact_input_variables[${key}]}")
+	done
+
+	declare -g artifact_input_vars="${concat[*]@Q}" # @Q to quote
+
+}
+
 # This is meant to be run after config, inside default build.
 function build_artifact_for_image() {
 	initialize_artifact "${WHAT}"
@@ -222,13 +280,7 @@ function build_artifact_for_image() {
 	# Make sure ORAS tooling is installed before starting.
 	run_tool_oras
 
-	# Detour: if building kernel, and KERNEL_CONFIGURE=yes, ignore artifact cache.
-	if [[ "${WHAT}" == "kernel" && "${KERNEL_CONFIGURE}" == "yes" ]]; then
-		display_alert "Ignoring artifact cache for kernel" "KERNEL_CONFIGURE=yes" "info"
-		ARTIFACT_IGNORE_CACHE="yes" obtain_complete_artifact
-	else
-		obtain_complete_artifact
-	fi
+	obtain_complete_artifact
 
 	return 0
 }
@@ -320,5 +372,13 @@ function is_artifact_available_in_remote_cache() {
 function obtain_artifact_from_remote_cache() {
 	display_alert "Obtaining artifact from remote cache" "${artifact_full_oci_target} into ${artifact_final_file_basename}" "info"
 	oras_pull_artifact_file "${artifact_full_oci_target}" "${artifact_base_dir}" "${artifact_final_file_basename}"
+
+	# sanity check: after obtaining remotely, is it available locally? it should, otherwise there's some inconsistency.
+	declare artifact_exists_in_local_cache="not-yet-after-obtaining-remotely"
+	is_artifact_available_in_local_cache
+	if [[ "${artifact_exists_in_local_cache}" == "no" ]]; then
+		exit_with_error "Artifact is not available in local cache after obtaining remotely: ${artifact_full_oci_target} into '${artifact_base_dir}' file '${artifact_final_file_basename}'"
+	fi
+
 	return 0
 }
